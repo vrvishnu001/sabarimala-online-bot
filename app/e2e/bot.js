@@ -89,17 +89,27 @@ const MONTH_NAMES = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SE
 const ACTION_TIMEOUT_MS = 10000;
 // Only two waits stay longer, because the site can be slow there: the slot cards
 // loading after the route is picked, and the payment page loading after "Proceed".
-// A short timeout on the payment page would wrongly stop the bot (booking state uncertain).
 const SLOW_WAIT_MS = 30000;
 
 // --- Multi-round booking settings ---
-// If a round fails (no slot, page error...), the whole flow restarts from the first step.
+// If a round fails (no slot, page error, booking not confirmed...), the whole flow restarts
+// from the first step (the wishlist is cleared again) and the same pilgrims are retried.
 // Stop only after this many failures in a row, so a permanent problem does not loop forever.
 let MAX_CONSECUTIVE_FAILURES = 20;
 let RETRY_DELAY_MS = 5000;
 
 // How many times to click "Add to Wishlist" if the Proceed popup does not appear.
 const ADD_TO_WISHLIST_ATTEMPTS = 3;
+
+// --- Booking success check ---
+// A round counts as BOOKED only when one of these is seen after the final "Proceed":
+//   1) the page has left the /darshan booking page (e.g. payment gateway or confirmation page), OR
+//   2) the URL matches BOOKING_SUCCESS_URL_REGEX, OR
+//   3) the page text matches BOOKING_SUCCESS_TEXT_REGEX.
+// If none appears within SLOW_WAIT_MS, the round is treated as NOT booked and retried.
+// Tune these two patterns using the "Final page URL / Final page text" lines in the log.
+const BOOKING_SUCCESS_URL_REGEX = /payment|ticket|confirm|success|receipt|invoice/i;
+const BOOKING_SUCCESS_TEXT_REGEX = /booking (is )?(successful|confirmed)|successfully (booked|added)|booking id|ticket (no|number)|transaction id|payment (successful|success)/i;
 
 // Remembers who each pilgrim row is (by its text), so after some pilgrims are booked
 // and the list changes, the remaining ones are still found correctly.
@@ -144,8 +154,8 @@ async function runBookingBot() {
         });
         page.on('pageerror', (error) => console.error(`Browser page error: ${error.message}`));
 
-        let remaining = [...PILGRIM_ROWS];
-        for (const k of Object.keys(pilgrimIdentity)) delete pilgrimIdentity[k]; // pilgrim rows still NOT booked
+        let remaining = [...PILGRIM_ROWS]; // pilgrim rows still NOT confirmed booked
+        for (const k of Object.keys(pilgrimIdentity)) delete pilgrimIdentity[k];
         let failures = 0;
         let round = 0;
 
@@ -155,30 +165,29 @@ async function runBookingBot() {
             console.log(`Pilgrims still to book (rows): ${remaining.join(', ')}`);
 
             try {
+                // Returns rows only after the booking was CONFIRMED (see verifyBookingSuccess).
                 const bookedRows = await runOneRound(page, remaining);
 
                 if (!bookedRows || bookedRows.length === 0) {
                     throw new Error('No pilgrim could be booked in this round.');
                 }
 
-                // No payment is needed, so once the final steps finish the booking is considered done.
+                // Confirmed booked -> remove them from the remaining list.
                 remaining = remaining.filter((r) => !bookedRows.includes(r));
                 failures = 0;
                 console.log(`✅ Booked row(s): ${bookedRows.join(', ')}. Remaining: ${remaining.length ? remaining.join(', ') : 'none'}`);
             } catch (err) {
                 if (STOPPED) break;
-                if (err.code === 'BOOKING_STATE_UNCERTAIN') {
-                    console.error(`🛑 ${err.message}`);
-                    console.error('Check the wishlist before starting another round.');
-                    break;
-                }
+                // Not confirmed / any failure: the pilgrims of this round stay in "remaining".
+                // The next round clears the wishlist and books them again.
                 failures++;
                 console.error(`⚠️ Round ${round} failed (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${err.message.split('\n')[0]}`);
+                console.log(`Still not booked: rows ${remaining.join(', ')}`);
                 if (failures >= MAX_CONSECUTIVE_FAILURES) {
                     console.log('🛑 Too many failures in a row. Stopping automation.');
                     break;
                 }
-                console.log(`Restarting from the initial step in ${RETRY_DELAY_MS / 1000} seconds...`);
+                console.log(`Restarting from the initial step (wishlist will be cleared) in ${RETRY_DELAY_MS / 1000} seconds...`);
                 await page.waitForTimeout(RETRY_DELAY_MS);
             }
         }
@@ -201,13 +210,13 @@ async function runBookingBot() {
 }
 
 /**
- * One full booking pass (login -> clear wishlist -> date -> route/slot -> pilgrims -> nominees -> payment screen)
+ * One full booking pass (login -> clear wishlist -> date -> route/slot -> pilgrims -> nominees -> checkout)
  * for as many of the remaining pilgrims as the chosen slot has room for.
- * Returns the list of pilgrim rows that were selected in this pass.
+ * Returns the list of pilgrim rows ONLY if the booking was confirmed; otherwise it throws.
  */
 async function runOneRound(page, remaining) {
     console.log('--- STARTING LOGIN & NAVIGATION ---');
-    await loginAndOpenBookingPage(page); // also clears the wishlist if it has an item
+    await loginAndOpenBookingPage(page); // always clears the wishlist if it has an item
 
     // Date selection (loops/refreshes until the target date is available)
     const dateSelected = await selectDateOnly(page);
@@ -264,7 +273,7 @@ async function runOneRound(page, remaining) {
     // "No" for both contribution options
     await selectContributionNo(page);
 
-    // Wishlist & payment steps
+    // Wishlist & checkout steps (throws if the booking is not confirmed)
     await handleFinalSteps(page);
 
     return selectedRows;
@@ -276,8 +285,7 @@ async function runOneRound(page, remaining) {
 
 /**
  * Initial steps: open the site, login if needed, go to the Virtual-Q booking page,
- * then clear the wishlist if it has an item.
- * Safe to call again for every round.
+ * then clear the wishlist if it has an item. Runs at the start of EVERY round.
  */
 async function loginAndOpenBookingPage(page) {
     await page.goto('https://sabarimalaonline.org/#/darshan');
@@ -828,7 +836,7 @@ async function pageProblemText(page) {
             const out = [];
             for (const sel of selectors) {
                 document.querySelectorAll(sel).forEach((el) => {
-                    const t = (el.innerText || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
+                    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
                     if (t) out.push(`${sel}: ${t.slice(0, 150)}`);
                     else if (sel === '.ng-invalid:not(form)') out.push(`invalid field: ${el.tagName.toLowerCase()}${el.getAttribute('placeholder') ? ' [' + el.getAttribute('placeholder') + ']' : ''}`);
                 });
@@ -842,13 +850,49 @@ async function pageProblemText(page) {
 }
 
 /**
- * Handles the wishlist and proceed steps to reach payment.
- *
- * Two kinds of failure:
- *  - BEFORE the first "Proceed" is clicked: nothing was submitted for payment, so this is a
- *    normal failure -> the round restarts (the next round clears the wishlist first).
- *  - AFTER the first "Proceed" is clicked: we cannot know whether the booking went through,
- *    so this stays BOOKING_STATE_UNCERTAIN and stops the bot.
+ * Waits (up to SLOW_WAIT_MS) for a sign that the booking really went through.
+ * Success = the page left the /darshan booking page, OR the URL matches
+ * BOOKING_SUCCESS_URL_REGEX, OR the page text matches BOOKING_SUCCESS_TEXT_REGEX.
+ * Returns true if confirmed, false if nothing confirmed it in time.
+ */
+async function verifyBookingSuccess(page) {
+    console.log('--- VERIFYING BOOKING ---');
+    const deadline = Date.now() + SLOW_WAIT_MS;
+    let lastUrl = '';
+    let lastText = '';
+
+    while (Date.now() < deadline) {
+        if (STOPPED) throw new Error('Stopped');
+
+        lastUrl = page.url();
+        lastText = normalizeText(await page.locator('body').innerText().catch(() => '')).slice(0, 300);
+
+        const onLogin = /login|signin/i.test(lastUrl);
+        const leftDarshan = !lastUrl.includes('/darshan') && !onLogin;
+        const urlMatch = BOOKING_SUCCESS_URL_REGEX.test(lastUrl);
+        const textMatch = BOOKING_SUCCESS_TEXT_REGEX.test(lastText);
+
+        if (leftDarshan || urlMatch || textMatch) {
+            const why = leftDarshan ? 'page left /darshan' : (urlMatch ? 'success URL matched' : 'success text matched');
+            console.log(`Final page URL: ${lastUrl}`);
+            console.log(`Final page text: ${lastText || 'could not read'}`);
+            console.log(`✅ Booking confirmed (${why}).`);
+            return true;
+        }
+
+        await page.waitForTimeout(1000);
+    }
+
+    console.log(`Final page URL: ${lastUrl}`);
+    console.log(`Final page text: ${lastText || 'could not read'}`);
+    console.log('⚠️ No booking confirmation was seen.');
+    return false;
+}
+
+/**
+ * Handles the wishlist and proceed steps, then CONFIRMS the booking.
+ * Throws a normal error if anything is not confirmed, so the round restarts,
+ * the wishlist is cleared, and the same pilgrims are tried again.
  */
 async function handleFinalSteps(page) {
     console.log('--- STARTING FINAL CHECKOUT STEPS ---');
@@ -885,11 +929,10 @@ async function handleFinalSteps(page) {
             .slice(0, 10);
         console.log(`Current URL: ${page.url()}`);
         console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
-        // Normal (retryable) error: nothing went to payment. Round restarts and clears the wishlist.
         throw new Error('Add to Wishlist did not open the Proceed popup. Restarting the round.');
     }
 
-    // ---- Phase 2: first Proceed -> payment page (state becomes uncertain from here) ----
+    // ---- Phase 2: first Proceed -> payment page -> final Proceed ----
     try {
         await firstProceedButton.click();
         console.log('Clicked first "Proceed". Waiting for the payment page...');
@@ -910,16 +953,17 @@ async function handleFinalSteps(page) {
             .slice(0, 10);
         console.log(`Payment page Proceed button did not appear. Current URL: ${page.url()}`);
         console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
-        const failure = new Error(`Checkout state is uncertain after clicking Proceed: ${error.message}`);
-        failure.code = 'BOOKING_STATE_UNCERTAIN';
-        throw failure;
+        throw new Error(`Checkout did not reach the payment step: ${error.message.split('\n')[0]}`);
     }
 
-    // Give the site a moment to register the booking before the next round starts
+    // ---- Phase 3: confirm the booking really happened ----
     await page.waitForLoadState('networkidle', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
-    await page.waitForTimeout(3000);
+    const confirmed = await verifyBookingSuccess(page);
+    if (!confirmed) {
+        throw new Error('Booking was not confirmed. These pilgrims stay in the remaining list and will be booked again.');
+    }
 
-    console.log('--- ✅ AUTOMATION COMPLETE: NOW AT PAYMENT SCREEN ---');
+    console.log('--- ✅ BOOKING CONFIRMED FOR THIS ROUND ---');
 }
 
 // -------------------------------------------------------------------------
