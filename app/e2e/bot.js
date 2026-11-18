@@ -98,6 +98,9 @@ const SLOW_WAIT_MS = 30000;
 let MAX_CONSECUTIVE_FAILURES = 20;
 let RETRY_DELAY_MS = 5000;
 
+// How many times to click "Add to Wishlist" if the Proceed popup does not appear.
+const ADD_TO_WISHLIST_ATTEMPTS = 3;
+
 // Remembers who each pilgrim row is (by its text), so after some pilgrims are booked
 // and the list changes, the remaining ones are still found correctly.
 const pilgrimIdentity = {};
@@ -810,17 +813,84 @@ async function selectContributionNo(page) {
 }
 
 /**
+ * Reads any validation message / toast / popup text currently on the page,
+ * so the log shows WHY "Add to Wishlist" did not open the Proceed popup.
+ */
+async function pageProblemText(page) {
+    try {
+        const texts = await page.evaluate(() => {
+            const selectors = [
+                'mat-error', '.mat-error', '.error', '.text-danger', '.invalid-feedback',
+                '.alert', '.toast', '.toast-message', '.snack-bar-container', 'simple-snack-bar',
+                '.mat-snack-bar-container', '.swal2-popup', '.mat-dialog-container', '.modal-body',
+                '.ng-invalid:not(form)'
+            ];
+            const out = [];
+            for (const sel of selectors) {
+                document.querySelectorAll(sel).forEach((el) => {
+                    const t = (el.innerText || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
+                    if (t) out.push(`${sel}: ${t.slice(0, 150)}`);
+                    else if (sel === '.ng-invalid:not(form)') out.push(`invalid field: ${el.tagName.toLowerCase()}${el.getAttribute('placeholder') ? ' [' + el.getAttribute('placeholder') + ']' : ''}`);
+                });
+            }
+            return out.slice(0, 8);
+        });
+        return texts.length ? texts.join(' || ') : 'no message found on page';
+    } catch (e) {
+        return 'could not read page messages';
+    }
+}
+
+/**
  * Handles the wishlist and proceed steps to reach payment.
+ *
+ * Two kinds of failure:
+ *  - BEFORE the first "Proceed" is clicked: nothing was submitted for payment, so this is a
+ *    normal failure -> the round restarts (the next round clears the wishlist first).
+ *  - AFTER the first "Proceed" is clicked: we cannot know whether the booking went through,
+ *    so this stays BOOKING_STATE_UNCERTAIN and stops the bot.
  */
 async function handleFinalSteps(page) {
     console.log('--- STARTING FINAL CHECKOUT STEPS ---');
 
-    try {
-        await page.click('button#regi_continue:has-text("Add to Wishlist")');
-        console.log('Clicked "Add to Wishlist".');
+    const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
 
-        const firstProceedButton = page.locator('button:visible:has-text("Proceed")').first();
-        await firstProceedButton.waitFor({ state: 'visible', timeout: 15000 });
+    // ---- Phase 1: Add to Wishlist -> wait for the Proceed popup (retry the click if needed) ----
+    let popupShown = false;
+    for (let attempt = 1; attempt <= ADD_TO_WISHLIST_ATTEMPTS && !popupShown; attempt++) {
+        if (STOPPED) throw new Error('Stopped');
+        try {
+            const addBtn = page.locator('button#regi_continue:has-text("Add to Wishlist")');
+            await addBtn.scrollIntoViewIfNeeded();
+            await addBtn.click({ timeout: ACTION_TIMEOUT_MS });
+            console.log(`Clicked "Add to Wishlist" (attempt ${attempt}/${ADD_TO_WISHLIST_ATTEMPTS}).`);
+        } catch (e) {
+            console.log(`⚠️ Could not click "Add to Wishlist" (attempt ${attempt}): ${e.message.split('\n')[0]}`);
+            continue;
+        }
+
+        try {
+            await firstProceedButton.waitFor({ state: 'visible', timeout: 8000 });
+            popupShown = true;
+        } catch (e) {
+            console.log(`⚠️ Proceed popup did not appear after attempt ${attempt}. Page says: ${await pageProblemText(page)}`);
+            await page.waitForTimeout(1000);
+        }
+    }
+
+    if (!popupShown) {
+        const visibleButtons = (await page.locator('button:visible').allInnerTexts())
+            .map((text) => text.trim())
+            .filter(Boolean)
+            .slice(0, 10);
+        console.log(`Current URL: ${page.url()}`);
+        console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
+        // Normal (retryable) error: nothing went to payment. Round restarts and clears the wishlist.
+        throw new Error('Add to Wishlist did not open the Proceed popup. Restarting the round.');
+    }
+
+    // ---- Phase 2: first Proceed -> payment page (state becomes uncertain from here) ----
+    try {
         await firstProceedButton.click();
         console.log('Clicked first "Proceed". Waiting for the payment page...');
 
@@ -830,7 +900,7 @@ async function handleFinalSteps(page) {
         });
         console.log('Payment page Proceed button is visible.');
 
-        // 5. Click the final "Proceed" button on the payment gateway
+        // Click the final "Proceed" button on the payment gateway
         await page.click('button#regi_continue:has-text("Proceed")');
         console.log('Clicked final "Proceed" button on Payment Gateway.');
     } catch (error) {
@@ -840,7 +910,7 @@ async function handleFinalSteps(page) {
             .slice(0, 10);
         console.log(`Payment page Proceed button did not appear. Current URL: ${page.url()}`);
         console.log(`Visible buttons: ${visibleButtons.join(' | ') || 'none'}`);
-        const failure = new Error(`Checkout state is uncertain after attempting to add to the wishlist: ${error.message}`);
+        const failure = new Error(`Checkout state is uncertain after clicking Proceed: ${error.message}`);
         failure.code = 'BOOKING_STATE_UNCERTAIN';
         throw failure;
     }
